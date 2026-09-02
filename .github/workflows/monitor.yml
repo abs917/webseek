@@ -1,9 +1,8 @@
 name: webseek-monitor
-
 on:
   schedule:
-    - cron: '*/15 * * * *'          # 每 15 分钟一轮 (降频, 减少 GitHub API 限流)
-  workflow_dispatch:
+    - cron: '*/15 * * * *'          # 每 15 分钟运行一次
+  workflow_dispatch:                # 允许在 Actions 页面手动点击运行
 
 permissions:
   contents: write
@@ -20,27 +19,20 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
+          
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
+          
       - name: Install dependencies
         run: pip install -r requirements.txt
-
+        
       - name: Run webseek
-        env:
-          MAIL_SMTP_HOST: ${{ secrets.MAIL_SMTP_HOST }}
-          MAIL_SMTP_PORT: ${{ secrets.MAIL_SMTP_PORT }}
-          MAIL_SMTP_USER: ${{ secrets.MAIL_SMTP_USER }}
-          MAIL_SMTP_PASSWORD: ${{ secrets.MAIL_SMTP_PASSWORD }}
-          MAIL_FROM: ${{ secrets.MAIL_FROM }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python monitor.py --once --report-file .report.md
 
       - name: Create notification issue
         if: hashFiles('.report.md') != ''
-        continue-on-error: true        # 建 Issue 失败(如 API 限流)不拖红整轮
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -49,32 +41,40 @@ jobs:
           if [ "$COUNT" -gt 1 ]; then TITLE="$TITLE 等 ${COUNT} 处变化"; fi
           gh issue create --title "网页变化: $TITLE" --body-file .report.md
 
-      - name: Notify on failure
+      - name: Send Webhook on Change (页面变化推送到自己的服务器)
+        if: hashFiles('.report.md') != ''
+        continue-on-error: true
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+        run: |
+          REPORT_CONTENT=$(cat .report.md)
+          # 使用 jq 按照你的接口要求组装 JSON 结构
+          jq -n \
+            --arg title "Webseek 网页变化通知" \
+            --arg content "$REPORT_CONTENT" \
+            --arg type "markdown" \
+            '{"title": $title, "content": $content, "type": $type}' \
+            | curl -X POST -H "Content-Type: application/json" -d @- $WEBHOOK_URL
+
+      - name: Notify on failure (运行失败推送到自己的服务器)
         if: failure()
         env:
-          MAIL_SMTP_HOST: ${{ secrets.MAIL_SMTP_HOST }}
-          MAIL_SMTP_PORT: ${{ secrets.MAIL_SMTP_PORT }}
-          MAIL_SMTP_USER: ${{ secrets.MAIL_SMTP_USER }}
-          MAIL_SMTP_PASSWORD: ${{ secrets.MAIL_SMTP_PASSWORD }}
-          MAIL_FROM: ${{ secrets.MAIL_FROM }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
-          python -c "
-          import sys; sys.path.insert(0, '.')
-          import yaml, notify
-          cfg = yaml.safe_load(open('config.yaml', encoding='utf-8')) or {}
-          notify.send_email(cfg.get('notify', {}),
-              'webseek 监控运行失败',
-              '本轮监控执行失败, 请查看: https://github.com/XJungit/webseek/actions')
-          "
+          jq -n \
+            --arg title "Webseek 监控执行失败" \
+            --arg content "本轮监控执行失败，请去 GitHub 仓库查看 Actions 运行日志排查问题。" \
+            --arg type "text" \
+            '{"title": $title, "content": $content, "type": $type}' \
+            | curl -X POST -H "Content-Type: application/json" -d @- $WEBHOOK_URL
 
       - name: Commit state
         if: always()
-        continue-on-error: true        # 推送失败不拖红整轮, 避免失败 Issue 雪崩
+        continue-on-error: true
         run: |
           git config user.name "webseek-bot"
           git config user.email "webseek-bot@users.noreply.github.com"
-          git pull --rebase origin "${GITHUB_REF_NAME}" || true   # 先同步远端, 避免非快进拒收
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
           for f in state.json changes.log snapshots; do
             [ -e "$f" ] && git add -f "$f"
           done
